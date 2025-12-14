@@ -1,0 +1,299 @@
+class dFBA:
+    """
+    Attributes after initialization:
+    - base_model: original cobra model (never modified)
+    - model: working copy for simulation
+    - volume: culture volume (L)
+    - t: current time (h)
+    - state: current extracellular concentrations and biomass
+    - history: list of dicts with time series records
+    """
+
+    def __init__(self, iJO1366star, initial_vals,volume = 1.0, media = df_medium, sim_params: SimParams = None):
+        
+        self.base_model = iJO1366star
+        self.model = iJO1366star.copy()
+        self.volume = volume
+        self.params = sim_params
+        self.media = media
+        self.initial_vals = initial_vals
+        self.ex_tracker = []
+
+        
+        self.state = None
+        self.t = 0.0   
+        self.history = []
+
+        # close all exchanges
+        for rxn in self.model.exchanges:
+            rxn.lower_bound = 0.0
+            rxn.upper_bound = 1000.0 # allow excretion
+
+
+        for rxn in self.media['exchange_reaction_id']:
+            if rxn in self.model.reactions:
+                if rxn in ['EX_glc__D_e', 'EX_ac_e', 'EX_o2_e']:
+                    continue
+                else:
+                    self.model.reactions.get_by_id(rxn).lower_bound = -1000.0
+
+        if 'EX_o2_e' in self.model.reactions:
+            self.model.reactions.EX_o2_e.lower_bound = -9.0
+
+        # If ec_constrains is true, then the enzyme pool supply is open
+        # otherwise running standard FBA
+        if self.params.ec_constraints:
+            if 'ER_pool_TG_' in self.model.reactions:
+                print(self.model.reactions.ER_pool_TG_.lower_bound, self.model.reactions.ER_pool_TG_.upper_bound)
+                self.model.reactions.ER_pool_TG_.lower_bound = 0.0
+                # upper bound represents the mass fraction cells can "afford" to dedicate to metabolic enzymes
+                self.model.reactions.ER_pool_TG_.upper_bound = 0.0948 # (from paper)
+                print(self.model.reactions.ER_pool_TG_.lower_bound, self.model.reactions.ER_pool_TG_.upper_bound)
+
+        else:
+            # running standard FBA and no constraining enzyme pool
+            if 'ER_pool_TG_' in self.model.reactions:
+                print(self.model.reactions.ER_pool_TG_.lower_bound, self.model.reactions.ER_pool_TG_.upper_bound)
+                self.model.reactions.ER_pool_TG_.lower_bound = 0.0
+                self.model.reactions.ER_pool_TG_.upper_bound = 1000.0
+                print(self.model.reactions.ER_pool_TG_.lower_bound, self.model.reactions.ER_pool_TG_.upper_bound)
+
+        # Block secretion of unobserved byproducts
+        # without these blocks, the model will always choose fermentation over respiration
+        # fba optimizes growth instead of efficiency so when glucose is abundant, the model will prioritize fermentation to as it is faster than respiration but much less efficient 
+        block_rxns = [
+            'EX_lac__D_e', 'EX_lac__L_e', 'EX_etoh_e', 'EX_pyr_e', 'EX_dha_e',
+            'EX_12ppd__S_e', 'EX_12ppd__R_e', 'EX_acald_e', 'EX_for_e', 'EX_succ_e',
+            'EX_val__L_e', 'EX_hxa_e', 'EX_nh4_e', 'EX_4abut_e', 'EX_lipa_cold_e',
+            'EX_ala__L_e', 'EX_leu__L_e', 'EX_ile__L_e', 'EX_thr__L_e', 'EX_trp__L_e',
+            'EX_lys__L_e', 'EX_met__L_e', 'EX_phe__L_e', 'EX_pro__L_e', 'EX_ser__L_e',
+            'EX_tyr__L_e', 'EX_arg__L_e', 'EX_his__L_e', 'EX_gln__L_e', 'EX_glu__L_e',
+            'EX_asn__L_e', 'EX_cys__L_e','EX_4abut_e', 'EX_lipa_cold_e', 'EX_lipa_e',
+            'EX_enlipa_e', 'EX_akg_e', 'EX_hxan_e', 'NADTRHD', 'MOX', 'FESD1s'
+        ]
+
+        for rxn in block_rxns:
+            if rxn in self.model.reactions:
+                # set upper bound to 0 to prevent excretion
+                self.model.reactions.get_by_id(rxn).upper_bound = 0.0
+
+        # 1. Block the free transhydrogenase to force use of the costly membrane one (THD2pp)
+        if 'NADTRHD' in self.model.reactions:
+            self.model.reactions.NADTRHD.bounds = (0, 0)
+            print("Blocked leak: NADTRHD")
+
+        # 2. Block other zero-cost bypasses identified in your log
+        leaks = ['MOX', 'FESD1s'] 
+        for rid in leaks:
+            if rid in self.model.reactions:
+                self.model.reactions.get_by_id(rid).bounds = (0, 0)
+                print(f"Blocked leak: {rid}")        
+
+
+    @property
+    def print_history(self):
+        return pd.DataFrame(self.history)
+
+    def initialize_state(self):
+        """
+        initial_vals must a dict in the form:
+        {
+            'biomass': gDW/L
+            'glucose': mM
+            'acetate': mM
+        } 
+        """
+        
+        self.state = FermentationState(
+            self.initial_vals['biomass'], 
+            self.initial_vals['glucose'], 
+            self.initial_vals['acetate']
+        )
+        self.t = 2.0 # starting at t=2 since that is the first biomass measurement
+        
+
+        record = {
+                "t": self.t,
+                "X": self.state.biomass,
+                "glc": self.state.glc,
+                "ac": self.state.ac,
+                "growth_rate": "nan",                
+                "v_ex_glc": "nan",
+                "v_ex_ac": "nan",
+                "status": "nan"
+            }
+        self.history = [] # clear any previous runs
+        self.history.append(record)
+
+    def _check_for_leaks(self):
+
+        self.initialize_state()
+        sol = self.model.optimize()
+        leaks = False
+
+        current_leaks = [r.id for r in self.model.exchanges
+                         if r.id not in ['EX_ac_e', 'EX_co2_e', 'EX_h2o_e', 'EX_h_e']
+                         and sol.fluxes[r.id] > 0.1]
+
+        if current_leaks:
+            print(f"Leaks found: {current_leaks}")
+            leaks = True
+        else:
+            print("No leaks found")
+        
+        for rid in current_leaks:
+            if rid not in self.ex_tracker:
+                self.ex_tracker.append(rid)
+                # block the leak
+                self.model.reactions.get_by_id(rid).upper_bounds = 0.0
+                print(f"Blocking leak exchange: {rid}")
+
+        return leaks
+
+
+    def _set_exchange_bounds(self):
+        """
+        Internal method to set exchange bounds on model base on current state
+        """
+        m = self.model
+        p = self.params
+        s = self.state
+
+        # ---- GLUCOSE ----
+        # (mmol/L) / ((gDW/L) * h) = mmol/gDW/h
+        max_glc_uptake = s.glc / (s.biomass * p.dt)
+        ex_glc = m.reactions.get_by_id('EX_glc__D_e')
+        ex_glc.lower_bound = -max_glc_uptake
+
+        # ---- ACETATE ----
+        ex_ac = m.reactions.get_by_id('EX_ac_e')
+        # ---- uptake ----
+        max_ac_uptake = s.ac / (s.biomass * p.dt)
+        ex_ac.lower_bound = -max_ac_uptake
+        # ---- excretion (feedback inhibition) ----
+        if p.ac_feedback and s.ac > 0:
+            # values from paper
+            Vac_max = 2.0 # max excretion rate (mmol/gDW/h)
+            Cac_sat = 13.0 # saturation conc where excretion stops
+
+            if s.ac > Cac_sat:
+                v_ex_max = 0.0
+            else:
+                # logarithmic feedback
+                temp1 = -1.0 / math.log(p.ac_feedback_k / p.vmax_ac_ex)
+                temp2 = math.log(s.ac / p.ac_feedback_k)
+                v_ex_max = temp1 * temp2
+
+            v_ex_max = max(0.0, min(100.0, v_ex_max))
+            ex_ac.upper_bound = v_ex_max
+        else:
+            # unrestricted excretion
+            ex_ac.upper_bound = 1000.0
+
+        
+
+    def step(self):
+        """
+        Run single time step of length dt (h)
+
+        Returns a dict with the new state snapshot(time, biomass, glc, ac, status)
+        Appends snapshot to self.history
+        updates self.t, self.state
+        """
+
+        if self.state is None:
+            raise RuntimeError("State not initialized - call initialize_state first")
+
+        # 1) Set bounds
+        self._set_exchange_bounds()
+
+        # 2) Solve FBA 
+        solution = self.model.optimize()
+
+
+        # --- DIAGNOSTICS & LEAK PREVENTION ---
+        print(f"\n--- Time: {self.t:.2f} h ---")
+        print(f"Glucose Flux: {solution.fluxes.get('EX_glc__D_e', 0):.4f}")
+        print(f"Acetate Flux: {solution.fluxes.get('EX_ac_e', 0):.4f} (Max allowed: {self.model.reactions.EX_ac_e.upper_bound:.4f})")
+        print(f"Oxygen Flux:  {solution.fluxes.get('EX_o2_e', 0):.4f}")
+        print(f"Growth Rate:  {solution.objective_value:.4f}")
+        
+        # Define the "Safe List" of things that represent breathing/maintenance
+        # (Urea is sometimes used as nitrogen source or waste, usually safe to ignore cost)
+        safe_metabolites = ['EX_ac_e', 'EX_co2_e', 'EX_h2o_e', 'EX_h_e', 'EX_o2_e', 'EX_pi_e', 'EX_urea_e']
+
+        # Find high flux excretions that are NOT in the safe list
+        current_leaks = [r.id for r in self.model.exchanges 
+                         if r.id not in safe_metabolites 
+                         and solution.fluxes[r.id] > 0.1]  # Threshold for "significant" leak
+
+        if current_leaks:
+            print("Non-essential Excretion Detected (Potential Leak):", current_leaks)
+            
+            for rid in current_leaks:
+                # If we haven't already blocked it, block it now
+                if rid not in self.ex_tracker:
+                    self.ex_tracker.append(rid)
+                    self.model.reactions.get_by_id(rid).upper_bound = 0.0
+                    print(f"Auto-blocking leak exchange: {rid}")
+                    
+                    # OPTIONAL: Re-solve immediately to force the correct path 
+                    # in *this* time step, rather than waiting for the next one.
+                    # solution = self.model.optimize() 
+        # -------------------------------------
+
+
+
+
+
+        if solution.status != 'optimal':
+            # if soln is unfeasible, assume growth stops or cell death occurs
+            # == freeze cell state
+            growth_rate = 0.0
+            v_glc = 0.0
+            v_ac = 0.0
+            status = 'infeasible'
+        else:
+            growth_rate = solution.objective_value
+            v_glc = solution.fluxes['EX_glc__D_e']
+            v_ac = solution.fluxes['EX_ac_e']
+            status = 'optimal'
+
+        dt = self.params.dt
+
+        # 3) update state 
+        # dC/dt = Flux * Biomass
+        d_glc = v_glc * self.state.biomass * dt
+        d_ac = v_ac * self.state.biomass * dt
+
+        new_glc = max(self.state.glc + d_glc, 0.0) # can't be negative
+        new_ac = max(self.state.ac + d_ac, 0.0)
+
+        # update biomass
+        # X_new = X_old * exp(growth_rate * dt)
+        new_biomass = self.state.biomass * math.exp(growth_rate * dt)
+
+        # 4) advance time and update state
+        self.t += dt
+        self.state = FermentationState(new_biomass, new_glc, new_ac)
+
+        record = {
+                "t": self.t,
+                "X": self.state.biomass,
+                "glc": self.state.glc,
+                "ac": self.state.ac,
+                "growth_rate": growth_rate,                
+                "v_ex_glc": v_glc,
+                "v_ex_ac": v_ac,
+                "status": solution.status,
+            }
+        self.history.append(record)
+        return record
+    
+    def run(self, t_max):
+
+        self.initialize_state()
+        while self.t < t_max:
+            self.step()
+
+        
