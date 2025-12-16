@@ -1,0 +1,30 @@
+name: fba
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.10
+  - libsbml=5.20.5
+  - openpyxl=3.1.5
+  - pyyaml=6.0.3
+  - ipykernel
+  - jupyter
+  - pip
+  - pip:
+    # Core FBA/dFBA packages
+    - cobra==0.29.1
+    - geckopy==2.0.2
+    - pytfa==0.9.4
+    - optlang==1.8.3
+    - swiglpk==5.0.12
+    - python-libsbml==5.20.5
+    # Data science stack
+    - numpy==2.2.6
+    - pandas==2.3.3
+    - scipy==1.15.3
+    # Visualization
+    - matplotlib==3.10.5
+    - seaborn==0.13.2
+    - bokeh==3.8.0
+
