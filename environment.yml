@@ -26,5 +26,5 @@ dependencies:
     # Visualization
     - matplotlib==3.10.5
     - seaborn==0.13.2
-    - bokeh==3.8.0
+
 
